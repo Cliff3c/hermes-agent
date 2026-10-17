@@ -26,7 +26,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-from agent.lsp import eventlog
+from agent.lsp import eventlog, sync_diagnostics
 from agent.lsp.client import _diagnostic_key
 from agent.lsp.servers import language_id_for
 
@@ -35,10 +35,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("agent.lsp.edit_check")
 
-# A write waits for an in-flight verdict only while it stays inside WRITE_BUDGET (from write entry),
-# and never longer than INLINE_GRACE: a warm pyright usually answers a small edit inside it.
+# A write waits for its verdict only while it stays inside WRITE_BUDGET (from write entry).  A warm
+# tsserver answers its synchronous request in ~10-30ms and a warm pyright its pull in ~10-90ms, so the
+# common verdict is reported inline; a slower one is delivered later (agent.lsp.deferred).
 WRITE_BUDGET = 0.08
-INLINE_GRACE = 0.05
+INLINE_GRACE = 0.08
 _VERDICT_CAP = 256  # per-file last verdicts kept for baseline reuse
 _SPAWN_CEILING = 60.0  # outer bound on one check beyond its two waits (cold spawn + initialize)
 
@@ -164,7 +165,8 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
     server_id = srv.server_id if srv is not None else "lsp"
     language_id = language_id_for(abs_path, srv)
     checks: EditChecks = svc._edit_checks
-    if client.seeds_first_push and client.document_text(abs_path) is None:
+    use_sync = sync_diagnostics.supported(client)
+    if client.seeds_first_push and client.document_text(abs_path) is None and not use_sync:
         # First sync of this document on a seeding server: its first push is a verdict on the didOpen
         # text that never counts as fresh.  Open the pre-edit text so that push becomes the baseline;
         # a new file is opened as written, so the seed is the verdict itself.
@@ -177,12 +179,11 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
             checks.remember(abs_path, baseline_text, seed)
     version = await client.open_file(abs_path, language_id=language_id)
     await client.save_file(abs_path)
-    fresh = await client.wait_for_diagnostics(abs_path, version, mode=svc._wait_mode, timeout=budget)
+    diags = await _verdict(svc, client, abs_path, version, budget, use_sync)
     svc._touch(client)
-    if not fresh:
+    if diags is None:
         # Alive but no verdict in budget: "no data", never stale stores (ghost diagnostics).
         return _report(server_id, abs_path, None)
-    diags = list(client.diagnostics_for(abs_path, fresh_only=True))
     synced = client.document_text(abs_path)
     if synced is not None:
         checks.remember(abs_path, synced, diags)
@@ -192,8 +193,9 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
             baseline = []
             base_version = await client.open_file(abs_path, language_id=language_id, text=baseline_text)
             # No verdict on the pre-edit text -> empty baseline: the filter removes less, never more.
-            if await client.wait_for_diagnostics(abs_path, base_version, mode=svc._wait_mode, timeout=budget):
-                baseline = list(client.diagnostics_for(abs_path, fresh_only=True))
+            base = await _verdict(svc, client, abs_path, base_version, budget, use_sync)
+            if base is not None:
+                baseline = base
                 checks.remember(abs_path, baseline_text, baseline)
             # Leave the server holding the bytes on disk again (its verdict on them is already in hand).
             await client.open_file(abs_path, language_id=language_id)
@@ -201,6 +203,23 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
         seen = {_diagnostic_key(d) for d in shift_baseline(baseline, build_line_shift(baseline_text, synced))}
         diags = [d for d in diags if _diagnostic_key(d) not in seen]
     return _report(server_id, abs_path, diags)
+
+
+async def _verdict(svc: LSPService, client: Any, abs_path: str, version: int, budget: float,
+                   use_sync: bool) -> Optional[_Diags]:
+    """Diagnostics on the text synced at ``version``: a synchronous request where the server has one
+    (``agent.lsp.sync_diagnostics``, ~10ms, so the write can report it inline), else the push/pull
+    wait.  None = no verdict within ``budget``."""
+    if use_sync:
+        try:
+            diags = await sync_diagnostics.request(client, abs_path, timeout=budget)
+        except TimeoutError:
+            return None
+        if diags is not None:
+            return diags
+    if not await client.wait_for_diagnostics(abs_path, version, mode=svc._wait_mode, timeout=budget):
+        return None
+    return list(client.diagnostics_for(abs_path, fresh_only=True))
 
 
 def _report(server_id: str, abs_path: str, diags: Optional[_Diags]) -> Optional[_Diags]:

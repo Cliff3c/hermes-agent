@@ -358,7 +358,8 @@ class LintMixin:
             result = future.result(timeout=inline_wait(started))
         except concurrent.futures.TimeoutError:
             if owner:
-                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, superseded))
+                token = deferred.track_pending(owner)
+                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, superseded, token))
             return ""
         except Exception:  # LSP never breaks a write
             logger.debug("LSP edit check failed for %s", path, exc_info=True)
@@ -383,9 +384,18 @@ def _format_lsp_block(path: str, diagnostics, header: str) -> str:
         return ""
 
 
-def _post_deferred(owner: str, abs_path: str, future, superseded) -> None:
-    """Done-callback (LSP loop thread): queue a late verdict for the session that made the edit.
-    No verdict (timeout, dead server) puts back the older note this check had superseded."""
+def _post_deferred(owner: str, abs_path: str, future, superseded, token) -> None:
+    """Done-callback (LSP loop thread): queue a late verdict for the session that made the edit, then
+    release a turn end waiting on it (``agent.lsp.deferred.settle_for_agent``)."""
+    from agent.lsp import deferred
+    try:
+        _queue_late_verdict(owner, abs_path, future, superseded)
+    finally:
+        deferred.settled(owner, token)
+
+
+def _queue_late_verdict(owner: str, abs_path: str, future, superseded) -> None:
+    """No verdict (timeout, dead server) puts back the older note this check had superseded."""
     from agent.lsp import deferred
     try:
         result = None if future.cancelled() else future.result()

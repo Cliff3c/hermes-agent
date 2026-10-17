@@ -8,6 +8,11 @@ at its next tool result, or its next user turn when no tool runs again
 
 A later edit of the same file takes over an undelivered verdict: the newer check diffs against the
 older baseline, so an error the first edit introduced is still reported unless the second fixed it.
+
+A verdict must not be lost when the edit was the turn's last tool call (a one-shot ``-q`` run has no
+next turn): checks still running are tracked per session (:func:`track_pending`), and before the turn's
+final answer is accepted :func:`settle_for_agent` waits for them (bounded) and returns every verdict
+still undelivered, which ``agent.turn_stop_gates`` hands to the model as a new message.
 """
 from __future__ import annotations
 
@@ -22,6 +27,9 @@ _OWNER: ContextVar[Optional[str]] = ContextVar("hermes_lsp_deferred_owner", defa
 _MAX_OWNERS = 64  # sessions that never drain (a one-shot caller) must not grow this forever
 _MAX_PER_OWNER = 32
 _LOCK = threading.Lock()
+_SETTLED = threading.Condition(_LOCK)
+# A turn-end wait longer than this hands the verdict to the next user turn instead.
+TURN_END_WAIT = 5.0
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,8 @@ class _Note:
 
 # owner -> {abs path -> note}, oldest owner first
 _QUEUED: OrderedDict[str, OrderedDict[str, _Note]] = OrderedDict()
+# owner -> tokens of its checks still running (their verdict lands in _QUEUED or nowhere)
+_PENDING: dict[str, set[object]] = {}
 
 
 @contextlib.contextmanager
@@ -91,11 +101,45 @@ def pop_notes(*owners: Optional[str]) -> list[tuple[str, str]]:
     return out
 
 
+def track_pending(owner: str) -> object:
+    """Record a check of ``owner``'s still running; pass the token to :func:`settled` once its verdict
+    has been posted (or dropped)."""
+    token = object()
+    with _LOCK:
+        _PENDING.setdefault(owner, set()).add(token)
+    return token
+
+
+def settled(owner: str, token: object) -> None:
+    with _SETTLED:
+        tokens = _PENDING.get(owner)
+        if tokens is not None:
+            tokens.discard(token)
+            if not tokens:
+                del _PENDING[owner]
+        _SETTLED.notify_all()
+
+
+def _owners(agent: Any) -> tuple[Optional[str], ...]:
+    owners = (getattr(agent, "session_id", None), getattr(agent, "_current_task_id", None))
+    return tuple(o if isinstance(o, str) else None for o in owners)
+
+
+def settle_for_agent(agent: Any, timeout: float = TURN_END_WAIT) -> list[tuple[str, str]]:
+    """Turn end: wait up to ``timeout`` for ``agent``'s running checks, then pop every undelivered
+    ``(path, text)`` verdict.  Returns at once when nothing is running."""
+    owners = [o for o in dict.fromkeys(_owners(agent)) if o]
+    if not owners:
+        return []
+    with _SETTLED:
+        _SETTLED.wait_for(lambda: not any(_PENDING.get(o) for o in owners), timeout=timeout)
+    return pop_notes(*owners)
+
+
 def forward_to_agent(agent: Any) -> None:
     """Move ``agent``'s finished verdicts onto its live-notes queue, which rides the next tool result
     (or the next user turn).  Called right before that tool result is built."""
-    owners = (getattr(agent, "session_id", None), getattr(agent, "_current_task_id", None))
-    notes = pop_notes(*owners)
+    notes = pop_notes(*_owners(agent))
     if not notes:
         return
     from agent.plugin_live_notes import queue_plugin_notice
@@ -103,4 +147,5 @@ def forward_to_agent(agent: Any) -> None:
         queue_plugin_notice(agent, f"lsp:{path}", text)
 
 
-__all__ = ["bind_owner", "current_owner", "forward_to_agent", "pop_notes", "post", "restore", "take"]
+__all__ = ["TURN_END_WAIT", "bind_owner", "current_owner", "forward_to_agent", "pop_notes", "post", "restore",
+           "settle_for_agent", "settled", "take", "track_pending"]

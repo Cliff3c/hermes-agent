@@ -84,3 +84,29 @@ def test_late_diagnostics_reach_the_session(mock_workspace):
     assert notes, "the late verdict never reached the session"
     (path, text), = notes
     assert path == str(target) and "MOCK001" in text and "earlier edit" in text
+
+
+def test_late_verdict_reaches_the_model_before_the_turn_ends(mock_workspace, monkeypatch):
+    """The turn's last edit gets a verdict after its tool result returned: the turn must not end on
+    it (a one-shot run has no next turn).  The final-answer gate waits for it and hands it to the
+    model as a new message, continuing the turn."""
+    from types import SimpleNamespace
+
+    from agent.turn_stop_gates import apply_stop_gates
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    repo, _svc = mock_workspace("by_content", MOCK_LSP_PUSH_DELAY="0.4")
+    target = repo / "c.py"
+    target.write_text("x = 1\n", encoding="utf-8")
+    result, _elapsed = _patch(target, "x = 1", "x = bad", session="S-end")
+    assert result["success"] is True and "lsp_diagnostics" not in result, result
+    agent = SimpleNamespace(session_id="S-end", _current_task_id="t-lsp",
+                            _interim_content_was_streamed=lambda _text: False,
+                            _emit_interim_assistant_message=lambda _msg: None,
+                            _flush_messages_to_session_db=lambda *_a: None)
+    messages = [{"role": "user", "content": "edit c.py"}]
+    verdict = apply_stop_gates(agent, {"role": "assistant", "content": "done"}, final_response="done",
+                               messages=messages, conversation_history=[],
+                               pending_verification_response=None, pending_verification_response_previewed=False)
+    assert verdict.continue_turn, "the turn ended with the edit's verdict still undelivered"
+    assert messages[-1]["role"] == "user" and "MOCK001" in messages[-1]["content"], messages[-1]

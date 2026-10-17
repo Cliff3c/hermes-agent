@@ -33,18 +33,23 @@ falls back silently to the syntax-only result.
 
 Concretely, on every successful `write_file` or `patch`:
 
-1. Hermes performs the write and returns. The tool never waits on the
-   language server beyond a short inline window (at most 50 ms, and
-   only while the whole write stays under about 80 ms).
-2. In the background, Hermes sends the new content to the language
-   server. When the server reports diagnostics, it compares them against
-   the server's verdict on the pre-edit content and keeps only the new
-   ones.
-3. If that verdict arrives inside the inline window, it appears in the
-   tool result's `lsp_diagnostics`. Otherwise it is attached to the
-   session's **next** tool result (or the next user turn if no tool
-   runs), labelled `LSP diagnostics introduced by your earlier edit of
-   <path>`. Earlier messages are never rewritten.
+1. Hermes performs the write, then sends the new content to the language
+   server. The write waits for the verdict only while the whole tool call
+   stays under about 80 ms.
+2. Hermes asks for the verdict directly where the server supports it:
+   TypeScript (`typescript-language-server`) answers a synchronous
+   diagnostics request, and pyright answers a document pull. Warm servers
+   usually reply in 10–90 ms. When the verdict has diagnostics, Hermes
+   compares them against the verdict on the pre-edit content and keeps
+   only the new ones.
+3. A verdict that arrives inside that window appears in the tool result's
+   `lsp_diagnostics`. A slower one (cold server, very large file) is
+   attached to the session's **next** tool result, labelled `LSP
+   diagnostics introduced by your earlier edit of <path>`. If the model
+   tries to finish the turn while a check is still running, Hermes waits
+   up to 5 s for it. Any problems it finds go to the model as a new
+   message before the answer is accepted, so a one-shot `hermes chat -q`
+   run still sees them. Earlier messages are never rewritten.
 
 If the same file is edited again before its check finishes, the newer
 check runs against the older edit's baseline. Errors the first edit
