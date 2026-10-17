@@ -6,11 +6,14 @@ linters are pure functions importable from this module.
 
 import ast
 import json
+import logging
 import os
 import tomllib
 from typing import Callable, Dict, Optional
 
 from tools.file_operations_common import ExecuteResult, LintResult
+
+logger = logging.getLogger(__name__)
 
 # Shell linters by extension (external toolchain). ``.tsx`` is deliberately absent:
 # it hits the "No linter" skip and LSP covers it when enabled.
@@ -324,35 +327,78 @@ class LintMixin:
         False so the shell linter still runs."""
         return bool(self._lsp_call("enabled_for", path, False))
 
-    def _snapshot_lsp_baseline(self, path: str) -> None:
-        """Capture pre-edit LSP diagnostics so the post-write delta is correct. Silent on failure."""
-        self._lsp_call("snapshot_baseline", path, None)
-
     def _maybe_lsp_diagnostics(self, path: str, *, pre_content: Optional[str] = None,
-                               post_content: Optional[str] = None) -> str:
-        """Formatted LSP diagnostics introduced by this edit, or "" when LSP is
-        unavailable/disabled/clean. With both pre and post content a line-shift map
-        remaps baseline diagnostics into post-edit coordinates; otherwise every
-        pre-existing diagnostic below an inserted line would look new."""
+                               post_content: Optional[str] = None, started: Optional[float] = None) -> str:
+        """Formatted LSP diagnostics this edit introduced, or "" when LSP is unavailable/disabled/clean
+        OR the verdict is not ready yet.  Never blocks the write on the language server: the check
+        (``agent.lsp.edit_check``) diffs the written file against ``pre_content`` (None = new file) on
+        the LSP loop.  The write waits for the verdict only until ``inline_deadline(started)`` (what is
+        left of the write's latency budget; ``started`` = ``time.monotonic()`` at write entry); a slower
+        verdict reaches the model with a later tool result of the same session (``agent.lsp.deferred``).
+        ``post_content`` is unused (the check reads the file it just wrote) and kept for callers."""
+        del post_content
         svc = self._lsp_service()
         if svc is None or not self._lsp_will_handle(path):
             return ""
-        line_shift = None
-        if pre_content is not None and post_content is not None and pre_content != post_content:
-            try:
-                from agent.lsp.range_shift import build_line_shift
-                line_shift = build_line_shift(pre_content, post_content)
-            except Exception:
-                line_shift = None
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
+            from agent.lsp import deferred
+            from agent.lsp.edit_check import inline_wait
+            abs_path = os.path.abspath(path)
+            owner = deferred.current_owner()
+            superseded = deferred.take(owner, abs_path)
+            inherited = (True, superseded.baseline_text) if superseded is not None else (False, None)
+            future = svc.start_edit_check(path, pre_text=pre_content, inherited=inherited)
         except Exception:
             return ""
-        if not diagnostics:
+        if future is None:
+            deferred.restore(owner, abs_path, superseded)
             return ""
+        import concurrent.futures
         try:
-            from agent.lsp.reporter import report_for_file, truncate
-            block = report_for_file(path, diagnostics)
-            return truncate("LSP diagnostics introduced by this edit:\n" + block) if block else ""
-        except Exception:
+            result = future.result(timeout=inline_wait(started))
+        except concurrent.futures.TimeoutError:
+            if owner:
+                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, superseded))
             return ""
+        except Exception:  # LSP never breaks a write
+            logger.debug("LSP edit check failed for %s", path, exc_info=True)
+            result = None
+        if result is None:
+            deferred.restore(owner, abs_path, superseded)
+            return ""
+        if result.superseded:
+            return ""
+        return _format_lsp_block(path, result.diagnostics, "LSP diagnostics introduced by this edit:\n")
+
+
+def _format_lsp_block(path: str, diagnostics, header: str) -> str:
+    if not diagnostics:
+        return ""
+    try:
+        from agent.lsp.reporter import report_for_file, truncate
+        block = report_for_file(path, diagnostics)
+        return truncate(header + block) if block else ""
+    except Exception:  # LSP never breaks a write
+        logger.debug("formatting LSP diagnostics for %s failed", path, exc_info=True)
+        return ""
+
+
+def _post_deferred(owner: str, abs_path: str, future, superseded) -> None:
+    """Done-callback (LSP loop thread): queue a late verdict for the session that made the edit.
+    No verdict (timeout, dead server) puts back the older note this check had superseded."""
+    from agent.lsp import deferred
+    try:
+        result = None if future.cancelled() else future.result()
+    except Exception:  # a failed check reports nothing; the older note goes back
+        logger.debug("deferred LSP edit check failed for %s", abs_path, exc_info=True)
+        result = None
+    if result is not None and result.superseded:
+        return  # the newer check of this file reports it
+    if result is None:
+        deferred.restore(owner, abs_path, superseded)
+        return
+    text = _format_lsp_block(abs_path, result.diagnostics, (
+        f"LSP diagnostics introduced by your earlier edit of {abs_path} "
+        "(the language server answered after that tool result returned):\n"))
+    if text:
+        deferred.post(owner, abs_path, text, result.baseline_text)

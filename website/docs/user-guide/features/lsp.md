@@ -33,10 +33,22 @@ falls back silently to the syntax-only result.
 
 Concretely, on every successful `write_file` or `patch`:
 
-1. Hermes captures a baseline of current diagnostics for the file.
-2. Performs the write.
-3. Re-queries the language server, filters out diagnostics that were
-   already in the baseline, and surfaces only the new ones.
+1. Hermes performs the write and returns. The tool never waits on the
+   language server beyond a short inline window (at most 50 ms, and
+   only while the whole write stays under about 80 ms).
+2. In the background, Hermes sends the new content to the language
+   server. When the server reports diagnostics, it compares them against
+   the server's verdict on the pre-edit content and keeps only the new
+   ones.
+3. If that verdict arrives inside the inline window, it appears in the
+   tool result's `lsp_diagnostics`. Otherwise it is attached to the
+   session's **next** tool result (or the next user turn if no tool
+   runs), labelled `LSP diagnostics introduced by your earlier edit of
+   <path>`. Earlier messages are never rewritten.
+
+If the same file is edited again before its check finishes, the newer
+check runs against the older edit's baseline. Errors the first edit
+introduced are still reported unless the second edit fixed them.
 
 The agent sees output like:
 

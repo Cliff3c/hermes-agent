@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
+from agent.lsp.edit_check import EditChecks
 from agent.lsp.servers import (
     SERVERS, UNTRUSTED_SAFE_SERVERS, ServerContext, ServerDef, custom_servers, find_server_for_file, language_id_for,
 )
@@ -184,6 +185,7 @@ class LSPService:
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
         self._delta_baseline: dict[str, _Diags] = {}
+        self._edit_checks = EditChecks()  # loop-thread state of start_edit_check
 
         if self._enabled and self._idle_timeout > 0:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
@@ -359,6 +361,16 @@ class LSPService:
             self._mark_broken_for_file(file_path, e)
             diags = []
         self._set_delta_baseline(os.path.abspath(file_path), diags or [])
+
+    def start_edit_check(self, file_path: str, *, pre_text: Optional[str],
+                         inherited: tuple[bool, Optional[str]] = (False, None)):
+        """Non-blocking post-write check (``agent.lsp.edit_check``): a Future of the diagnostics the edit
+        introduced, or None when LSP doesn't handle the file.  Replaces snapshot_baseline +
+        get_diagnostics_sync on the write path, which blocked the write on both waits."""
+        if not self.enabled_for(file_path):
+            return None
+        from agent.lsp import edit_check
+        return edit_check.start(self, file_path, pre_text=pre_text, inherited=inherited)
 
     def _set_delta_baseline(self, abs_path: str, diags: _Diags) -> None:
         """Store a baseline, refreshing recency (pop + reinsert) so eviction tracks write order.
@@ -573,7 +585,13 @@ class LSPService:
             return await self._attach_root(srv, client, root)
         if not owner:
             try:
-                client = await spawning
+                # Shielded: cancelling this waiter (its caller timed out) must not cancel the spawn
+                # every other waiter of this root shares.
+                client = await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                if spawning.cancelled():
+                    return None  # the owner was cancelled mid-spawn
+                raise
             except Exception:
                 return None
             return await self._attach_root(srv, client, root) if client is not None else None
@@ -591,6 +609,8 @@ class LSPService:
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
+            if not spawning.done():
+                spawning.cancel()  # owner cancelled/failed mid-spawn: release the waiters
 
     @staticmethod
     async def _attach_root(srv: ServerDef, client: LSPClient, root: str) -> LSPClient:
