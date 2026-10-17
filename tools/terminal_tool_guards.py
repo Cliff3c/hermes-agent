@@ -141,6 +141,44 @@ def _foreground_background_guidance(command: str) -> str | None:
     return next((msg for hit, msg in _FOREGROUND_GUIDANCE if hit(unquoted)), None)
 
 
+# `&` spellings that are not backgrounding: and-lists, fd redirects (`2>&1`, `>&2`, `&>`, `&>>`,
+# `<&3`) and the stderr pipe `|&`.
+_NON_BACKGROUND_AMP_RE = re.compile(r"&&|\d*[<>]&(?:\d+|-)?|&>>?|\|&")
+_TRAILING_AMP_ONLY_RE = re.compile(r"\s&\s*$")
+
+
+def trailing_amp_background_command(command: str) -> str | None:
+    """The command without its trailing `&` when that `&` is its ONLY backgrounding, else None.
+
+    Only the unambiguous shape converts: one line, one and-or list or pipeline (`a && b | c &`
+    backgrounds the whole list in bash, exactly what background=true runs), nothing after the
+    `&`. Inline `a & b`, `;` sequences, multi-line scripts/heredocs and nohup/disown/setsid keep
+    the refusal: there the caller may expect later commands to run after a readiness check, so
+    the tool cannot rewrite them safely. Quoted `&` (and inert heredoc bodies) never count.
+    """
+    if not isinstance(command, str) or _looks_like_help_or_version_command(command):
+        return None
+    unquoted = _strip_quotes(command)
+    if not _TRAILING_AMP_ONLY_RE.search(unquoted) or not command.rstrip().endswith("&"):
+        return None
+    body = unquoted.rstrip()[:-1]
+    if "\n" in body or "\r" in body or ";" in body or "#" in body or _SHELL_LEVEL_BACKGROUND_RE.search(body):
+        return None
+    if "&" in _NON_BACKGROUND_AMP_RE.sub("", body):
+        return None
+    stripped = command.rstrip()[:-1].rstrip()
+    if not stripped:
+        return None
+    # Approval runs on what executes (the stripped command). Some dangerous patterns key on the
+    # `&` itself (`hermes gateway run &` = gateway outside its service manager), so convert only
+    # when both spellings get the same verdict; otherwise the old refusal stands.
+    from tools.approval_detection import detect_dangerous_command, detect_hardline_command
+    if (detect_hardline_command(command)[0] != detect_hardline_command(stripped)[0]
+            or detect_dangerous_command(command)[0] != detect_dangerous_command(stripped)[0]):
+        return None
+    return stripped
+
+
 def _read_script_for_guard(env: Any, guard_cwd: str, script_path: str, max_bytes: int) -> Optional[str]:
     """Best-effort script read: host filesystem first, then a bounded
     ``env.execute('head -c ... < path')`` for remote backends. Binary content

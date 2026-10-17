@@ -235,6 +235,15 @@ process(action="write", session_id="proc_abc123", data="y")  # Send input
 
 PTY mode (`pty=true`) enables interactive CLI tools like Codex and Claude Code.
 
+A foreground command whose only backgrounding is a trailing `&` (for example
+`python3 -m http.server 8765 &` or `cd app && npm start > app.log 2>&1 &`) runs
+as `background=true` with the `&` removed, and the result carries an
+`auto_backgrounded` note with the `session_id`. It goes through the same
+approval checks as any background command. Shapes that mix in other commands
+(`server & curl ...`, `a; b &`, multi-line scripts) and `nohup`/`disown`/`setsid`
+wrappers are still refused with guidance, because Hermes cannot safely tell
+which part should keep running.
+
 Completed background commands retain their exit status and captured output in the
 active profile. Resume the conversation that launched the command (or its
 compressed continuation), then use the original `session_id` with

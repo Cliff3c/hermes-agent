@@ -850,7 +850,7 @@ def _command_requires_pipe_stdin(command: str) -> bool:
 
 from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
-    gateway_lifecycle_block, self_repo_block,
+    gateway_lifecycle_block, self_repo_block, trailing_amp_background_command,
 )
 from tools.terminal_tool_background import _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
 from tools.terminal_tool_result import finalize_foreground_result
@@ -1059,6 +1059,9 @@ class _ExecPlan:
     # Set when a foreground call asked for more than FOREGROUND_MAX_TIMEOUT and was promoted to a
     # tracked background process instead of being refused (the requested seconds, for the note).
     promoted_from_foreground_timeout: Optional[int] = None
+    # Set when a foreground `cmd &` (the trailing `&` its only backgrounding) is run as
+    # terminal(command="cmd", background=true) instead of being refused: the command to run.
+    auto_background_command: Optional[str] = None
 
 
 _PROMOTED_NOTE = (
@@ -1141,16 +1144,22 @@ def _plan_execution(
         # need the command itself rewritten, which the tool cannot do safely.
         # The detachment guidance applies whether or not the call is promoted: a promoted `cmd &`
         # would start a tracked shell that exits at once while its payload runs untracked.
-        guidance = _foreground_background_guidance(command)
-        if guidance:
-            raise _Rejected(_error_json(guidance, status="error"))
-        if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            promoted = timeout
+        # Exception: a lone TRAILING `&` is unambiguous (the caller asked for exactly what
+        # background=true does), so run it that way instead of spending a model turn on a resend.
+        auto_bg = trailing_amp_background_command(command)
+        if auto_bg is None:
+            guidance = _foreground_background_guidance(command)
+            if guidance:
+                raise _Rejected(_error_json(guidance, status="error"))
+            if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+                promoted = timeout
+    else:
+        auto_bg = None
 
     return _ExecPlan(
         config=config, env_type=env_type, effective_task_id=effective_task_id,
         image=image, cwd=cwd, host_cwd=host_cwd, effective_timeout=timeout or config["timeout"],
-        promoted_from_foreground_timeout=promoted,
+        promoted_from_foreground_timeout=promoted, auto_background_command=auto_bg,
     )
 
 
@@ -1173,6 +1182,28 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
         return result_json
     template = _PROMOTED_NOTE if data.get("notify_on_complete") else _PROMOTED_NOTE_POLL_ONLY
     data["promoted_from_foreground"] = template.format(requested=requested_timeout, cap=FOREGROUND_MAX_TIMEOUT)
+    return json.dumps(data, ensure_ascii=False)
+
+
+_AUTO_BACKGROUND_NOTE = (
+    "Ran in the background (the trailing & was converted to background=true; Hermes tracks the "
+    "process). Do NOT re-run it. Use process_manage (poll/log/wait/kill, session_id above) to check it."
+)
+
+
+def _with_auto_background_note(result_json: str) -> str:
+    """Attach the trailing-`&` conversion note to a spawn result (unchanged on error). The silent-
+    background hint is dropped: it says to re-launch with notify, which would start a second copy."""
+    try:
+        data = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(data, dict) or data.get("error"):
+        return result_json
+    from tools.terminal_tool_background import _SILENT_BACKGROUND_HINT
+    if data.get("hint") == _SILENT_BACKGROUND_HINT:
+        data.pop("hint")
+    data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -1400,6 +1431,11 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
+        auto_bg = getattr(plan, "auto_background_command", None)
+        if auto_bg is not None:
+            # From here on this IS a background=true call for the stripped command: every guard
+            # below (lifecycle, workdir, self-repo, dangerous-command approval) sees what runs.
+            command, background = auto_bg, True
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1464,6 +1500,8 @@ def terminal_tool(
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
+            elif auto_bg is not None:
+                result = _with_auto_background_note(result)
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
             command, env, plan,
