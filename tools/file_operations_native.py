@@ -56,7 +56,11 @@ def atomic_write(path: str, data: bytes) -> Optional[str]:
     Same contract as the shell script: a symlink target is written through (the link survives),
     parent directories are created, the temp file lives in the target's directory so the rename is
     atomic, an existing target's mode is kept and a new one gets the umask default (``O_CREAT`` with
-    0o666 applies the process umask itself), and the temp is removed on every failure."""
+    0o666 applies the process umask itself), and the temp is removed on every failure.
+
+    The temp holds its final mode before the first byte lands: an existing target's temp is created
+    0o600 and ``fchmod``-ed to the target's mode, so a private file's new contents are never readable
+    through a wider temp (the shell script's ``mktemp`` 0600 temp gave the same guarantee)."""
     target = os.path.realpath(path) if os.path.islink(path) else path
     parent = os.path.dirname(target) or "."
     try:
@@ -66,17 +70,18 @@ def atomic_write(path: str, data: bytes) -> Optional[str]:
         except FileNotFoundError:
             mode = None
         tmp = os.path.join(parent, f".hermes-tmp.{secrets.token_hex(6)}")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o666)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                     0o666 if mode is None else 0o600)
     except OSError as e:
         return f"{e.strerror or e}: {e.filename or target}"
     try:
-        with open(fd, "wb") as fh:
-            fh.write(data)
         if mode is not None:
             try:
-                os.chmod(tmp, mode)
+                os.fchmod(fd, mode)  # before any content: the bytes never sit in a wider file
             except OSError:
-                pass  # best effort, as in the shell script
+                pass  # best effort, as in the shell script (the temp then stays 0o600)
+        with open(fd, "wb") as fh:
+            fh.write(data)
         os.replace(tmp, target)
     except OSError as e:
         with contextlib.suppress(OSError):

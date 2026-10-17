@@ -62,7 +62,7 @@ def test_edit_check_started_for_local_env(tmp_path, monkeypatch):
         def enabled_for(self, path):
             return True
 
-        def start_edit_check(self, path, *, pre_text, inherited):
+        def start_edit_check(self, path, *, pre_text, owner=None, carry=()):
             started.append((path, pre_text))
 
     monkeypatch.setattr("agent.lsp.get_service", lambda: FakeService())
