@@ -495,3 +495,24 @@ def test_requests_verify_hands_over_the_platform_store_without_openssl_files(tmp
     # requests takes the bundle: the request fails on the closed port, not on a missing CA file.
     with pytest.raises(requests.exceptions.ConnectionError):
         requests.get("https://127.0.0.1:9/", verify=verify, timeout=2)
+
+
+def test_platform_store_bundle_survives_an_unwritable_home(tmp_path, monkeypatch):
+    """A full or read-only HERMES_HOME leaves requests_verify on its ``True`` fallback
+    instead of raising the disk error out of the requests call site."""
+    from agent import ssl_verify
+
+    import ssl
+
+    class _StoreWithACert(ssl.SSLContext):
+        # A Linux CA directory loads lazily and lists nothing; give the store one cert so the
+        # write (and its failure) is what decides the result.
+        def get_ca_certs(self, binary_form=False):
+            return [b"0"]
+
+    blocker = tmp_path / "home"
+    blocker.write_text("not a directory")  # mkdir(cache) under a file raises OSError
+    monkeypatch.setenv("HERMES_HOME", str(blocker))
+    monkeypatch.setattr(ssl_verify, "_PLATFORM_STORE_BUNDLE", None)
+    monkeypatch.setattr(ssl_verify, "_stdlib_ssl_context_class", lambda: _StoreWithACert)
+    assert ssl_verify._platform_store_bundle() is None

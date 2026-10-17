@@ -276,8 +276,12 @@ def _platform_store_bundle() -> Optional[str]:
     from utils import atomic_write_text
 
     path = get_hermes_home() / "cache" / "platform-ca-bundle.pem"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, "".join(ssl.DER_cert_to_PEM_cert(der) for der in certs))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, "".join(ssl.DER_cert_to_PEM_cert(der) for der in certs))
+    except OSError as exc:  # a full or read-only home must not replace the TLS fallback with a disk error
+        logger.debug("platform CA bundle not written: %s", exc, exc_info=True)
+        return None
     _PLATFORM_STORE_BUNDLE = str(path)
     return _PLATFORM_STORE_BUNDLE
 
