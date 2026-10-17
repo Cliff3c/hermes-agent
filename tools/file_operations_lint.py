@@ -345,13 +345,15 @@ class LintMixin:
             from agent.lsp.edit_check import inline_wait
             abs_path = os.path.abspath(path)
             owner = deferred.current_owner()
-            superseded = deferred.take(owner, abs_path)
-            inherited = (True, superseded.baseline_text) if superseded is not None else (False, None)
-            future = svc.start_edit_check(path, pre_text=pre_content, inherited=inherited)
+            # This session's undelivered verdict for the file: the new check takes it over (diffs
+            # against its baseline) and hands it back in ``result.carry`` only if it gets no verdict.
+            older = deferred.take(owner, abs_path)
+            carry = (older,) if older is not None else ()
+            future = svc.start_edit_check(path, pre_text=pre_content, owner=owner, carry=carry)
         except Exception:
             return ""
         if future is None:
-            deferred.restore(owner, abs_path, superseded)
+            deferred.restore(owner, abs_path, carry)
             return ""
         import concurrent.futures
         try:
@@ -359,15 +361,16 @@ class LintMixin:
         except concurrent.futures.TimeoutError:
             if owner:
                 token = deferred.track_pending(owner)
-                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, superseded, token))
+                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, carry, token))
             return ""
         except Exception:  # LSP never breaks a write
             logger.debug("LSP edit check failed for %s", path, exc_info=True)
-            result = None
-        if result is None:
-            deferred.restore(owner, abs_path, superseded)
+            deferred.restore(owner, abs_path, carry)
             return ""
         if result.superseded:
+            return ""
+        if result.diagnostics is None:
+            deferred.restore(owner, abs_path, result.carry)
             return ""
         return _format_lsp_block(path, result.diagnostics, "LSP diagnostics introduced by this edit:\n")
 
@@ -384,28 +387,33 @@ def _format_lsp_block(path: str, diagnostics, header: str) -> str:
         return ""
 
 
-def _post_deferred(owner: str, abs_path: str, future, superseded, token) -> None:
+def _post_deferred(owner: str, abs_path: str, future, carry, token) -> None:
     """Done-callback (LSP loop thread): queue a late verdict for the session that made the edit, then
     release a turn end waiting on it (``agent.lsp.deferred.settle_for_agent``)."""
     from agent.lsp import deferred
     try:
-        _queue_late_verdict(owner, abs_path, future, superseded)
+        _queue_late_verdict(owner, abs_path, future, carry)
     finally:
         deferred.settled(owner, token)
 
 
-def _queue_late_verdict(owner: str, abs_path: str, future, superseded) -> None:
-    """No verdict (timeout, dead server) puts back the older note this check had superseded."""
+def _queue_late_verdict(owner: str, abs_path: str, future, carry) -> None:
+    """A superseded check posts nothing: the newer check owns its verdict AND the notes it carried.
+    No verdict hands back only what the check still holds (``result.carry``), never the caller's copy."""
     from agent.lsp import deferred
     try:
         result = None if future.cancelled() else future.result()
     except Exception:  # a failed check reports nothing; the older note goes back
         logger.debug("deferred LSP edit check failed for %s", abs_path, exc_info=True)
-        result = None
-    if result is not None and result.superseded:
-        return  # the newer check of this file reports it
+        deferred.restore(owner, abs_path, carry)
+        return
     if result is None:
-        deferred.restore(owner, abs_path, superseded)
+        deferred.restore(owner, abs_path, carry)
+        return
+    if result.superseded:
+        return
+    if result.diagnostics is None:
+        deferred.restore(owner, abs_path, result.carry)
         return
     text = _format_lsp_block(abs_path, result.diagnostics, (
         f"LSP diagnostics introduced by your earlier edit of {abs_path} "

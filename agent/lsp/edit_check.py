@@ -10,9 +10,11 @@ only when that verdict has diagnostics, get the verdict on the pre-edit text the
 (or reuse the one an earlier check left for exactly that text) and return the diagnostics the edit
 introduced.
 The caller waits for it only within its latency budget (:func:`inline_wait`); a slower verdict is delivered later through
-:mod:`agent.lsp.deferred`.  A newer check of the same file runs after an unfinished one and takes it
-over (its baseline, and its result when the newer check gets no verdict), so a superseded edit's
-errors are still caught unless the newer edit fixed them.
+:mod:`agent.lsp.deferred`.  Checks of one file run one at a time (two checks syncing one document at
+once would satisfy each other's waits).  A newer check by the SAME session takes an unfinished one over
+(its baseline, the undelivered notes it carried, and its result when the newer check gets no verdict),
+so a superseded edit's errors are still caught unless the newer edit fixed them; a check by another
+session only queues behind it, so each session hears about its own edits only.
 """
 from __future__ import annotations
 
@@ -48,25 +50,31 @@ _Diags = list[dict[str, Any]]
 
 @dataclass
 class CheckResult:
-    diagnostics: _Diags  # introduced by the edit (baseline removed); [] = clean
+    diagnostics: Optional[_Diags]  # introduced by the edit (baseline removed); [] = clean; None = no verdict
     baseline_text: Optional[str]  # the pre-edit text this result was diffed against
-    superseded: bool = False  # a newer check of the file took this one over and will report it
+    superseded: bool = False  # a newer check of the file by the same session took this one over
+    # Undelivered older notes this check took over and did not settle (no verdict): the caller queues
+    # them again.  Empty whenever there is a verdict (it was diffed against the oldest baseline).
+    carry: tuple = ()
 
 
 @dataclass
 class _Inflight:
     task: asyncio.Task
     baseline_text: Optional[str]
+    carry: tuple
     superseded: bool = False
 
 
 class EditChecks:
-    """Per-service state, touched only on the loop thread: the last verdict per file (baseline reuse)
-    and the newest unfinished check per file."""
+    """Per-service state, touched only on the loop thread: the last verdict per file (baseline reuse),
+    the newest unfinished check per file (``tail``: serializes every session's checks of it) and per
+    ``(session, file)`` (``inflight``: the one a newer edit by that session takes over)."""
 
     def __init__(self) -> None:
         self.verdicts: OrderedDict[str, tuple[str, _Diags]] = OrderedDict()
-        self.inflight: dict[str, _Inflight] = {}
+        self.tail: dict[str, _Inflight] = {}
+        self.inflight: dict[tuple[Optional[str], str], _Inflight] = {}
 
     def remember(self, abs_path: str, text: str, diags: _Diags) -> None:
         self.verdicts.pop(abs_path, None)
@@ -90,45 +98,54 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
 
 
-def start(svc: LSPService, path: str, *, pre_text: Optional[str],
-          inherited: tuple[bool, Optional[str]] = (False, None)) -> Optional[concurrent.futures.Future]:
+def start(svc: LSPService, path: str, *, pre_text: Optional[str], owner: Optional[str] = None,
+          carry: tuple = ()) -> Optional[concurrent.futures.Future]:
     """Schedule the check of ``path`` (already written) on the service loop; the Future resolves to a
-    :class:`CheckResult` (or None when no server answered).  ``pre_text`` None = the file is new.
-    ``inherited`` = ``(True, text)`` when an undelivered verdict for this file is being superseded."""
+    :class:`CheckResult`.  ``pre_text`` None = the file is new.  ``owner`` = the editing session (None:
+    no later delivery, nothing to take over); ``carry`` = that session's undelivered notes for this
+    file (``agent.lsp.deferred``) this edit supersedes: the oldest one's baseline becomes ours."""
     from agent.async_utils import safe_schedule_threadsafe
     loop = svc._loop._loop
     if loop is None:
         return None
-    return safe_schedule_threadsafe(_serialized(svc, os.path.abspath(path), pre_text, inherited), loop)
+    return safe_schedule_threadsafe(_serialized(svc, os.path.abspath(path), pre_text, owner, tuple(carry)), loop)
 
 
-async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str],
-                      inherited: tuple[bool, Optional[str]]) -> Optional[CheckResult]:
-    """Run after any unfinished check of the same file (two checks syncing one document at once would
-    satisfy each other's waits), taking it over: its baseline becomes ours, and its result is ours to
-    report when we get no verdict.  Never cancelled: cancelling mid-spawn would restart a cold server
-    on every rapid edit."""
+async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], owner: Optional[str],
+                      carry: tuple) -> CheckResult:
+    """Run after any unfinished check of the same file; take over the same session's unfinished check:
+    its baseline and carried notes become ours, and its result is ours to report when we get no
+    verdict.  Never cancelled: cancelling mid-spawn would restart a cold server on every rapid edit."""
     checks: EditChecks = svc._edit_checks
-    baseline_text = inherited[1] if inherited[0] else pre_text
-    prev = checks.inflight.get(abs_path)
+    baseline_text = carry[0].baseline_text if carry else pre_text
+    tail = checks.tail.get(abs_path)
+    tail = tail if tail is not None and not tail.task.done() else None
+    prev = checks.inflight.get((owner, abs_path)) if owner else None
     if prev is not None and not prev.task.done():
         prev.superseded = True
-        baseline_text = prev.baseline_text
+        baseline_text, carry = prev.baseline_text, prev.carry + carry
     else:
         prev = None
     current = asyncio.current_task()
     assert current is not None
-    me = checks.inflight[abs_path] = _Inflight(current, baseline_text)
+    me = _Inflight(current, baseline_text, carry)
+    checks.tail[abs_path] = me
+    if owner:
+        checks.inflight[(owner, abs_path)] = me
     try:
         prev_result = None
-        if prev is not None:
-            await asyncio.wait({prev.task})
-            if not prev.task.cancelled() and prev.task.exception() is None:
-                prev_result = prev.task.result()
-            if me.superseded:
-                # A newer edit queued behind us while we waited: it checks the newest bytes against
-                # our baseline, so our own round trip would only delay it.  Hand it what we hold.
-                return CheckResult(prev_result.diagnostics, prev_result.baseline_text, True) if prev_result else None
+        waits = {t.task for t in (prev, tail) if t is not None}
+        if waits:
+            await asyncio.wait(waits)
+        if prev is not None and not prev.task.cancelled() and prev.task.exception() is None:
+            prev_result = prev.task.result()
+            if prev_result.diagnostics is None:
+                prev_result = None
+        if me.superseded:
+            # A newer edit by this session queued behind us: it checks the newest bytes against our
+            # baseline and owns our carried notes, so our own round trip would only delay it.
+            return CheckResult(prev_result.diagnostics if prev_result else None,
+                               prev_result.baseline_text if prev_result else baseline_text, True)
         budget = svc._wait_budget(abs_path)
         try:
             diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, budget),
@@ -137,20 +154,23 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str],
             raise
         except Exception as e:  # timeout / dead server: same treatment as the old blocking path
             logger.debug("LSP edit check failed for %s", abs_path, exc_info=True)
-            await _mark_broken(svc, abs_path, e)
+            await svc._mark_broken_for_file_async(abs_path, e)
             diags = None
         if diags is not None:
-            result: Optional[CheckResult] = CheckResult(diags, baseline_text)
+            result = CheckResult(diags, baseline_text)
         elif prev_result is not None:
             result = CheckResult(prev_result.diagnostics, prev_result.baseline_text)
         else:
-            result = None
-        if result is not None and me.superseded:
-            result.superseded = True
+            result = CheckResult(None, baseline_text, carry=carry)
+        result.superseded = me.superseded
+        if me.superseded:
+            result.carry = ()  # the newer check took them over
         return result
     finally:
-        if checks.inflight.get(abs_path) is me:
-            del checks.inflight[abs_path]
+        if checks.tail.get(abs_path) is me:
+            del checks.tail[abs_path]
+        if owner and checks.inflight.get((owner, abs_path)) is me:
+            del checks.inflight[(owner, abs_path)]
 
 
 async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], budget: float) -> Optional[_Diags]:
@@ -185,9 +205,10 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
         # Alive but no verdict in budget: "no data", never stale stores (ghost diagnostics).
         return _report(server_id, abs_path, None)
     synced = client.document_text(abs_path)
-    if synced is not None:
-        checks.remember(abs_path, synced, diags)
+    verdict = diags
     if diags and baseline_text is not None and synced is not None:
+        # Read the cached pre-edit verdict (an earlier check's, or the seed above) BEFORE this edit's
+        # verdict replaces the file's cache entry.
         baseline = checks.recall(abs_path, baseline_text)
         if baseline is None:
             baseline = []
@@ -196,12 +217,13 @@ async def _check(svc: LSPService, abs_path: str, baseline_text: Optional[str], b
             base = await _verdict(svc, client, abs_path, base_version, budget, use_sync)
             if base is not None:
                 baseline = base
-                checks.remember(abs_path, baseline_text, baseline)
             # Leave the server holding the bytes on disk again (its verdict on them is already in hand).
             await client.open_file(abs_path, language_id=language_id)
         from agent.lsp.range_shift import build_line_shift, shift_baseline
         seen = {_diagnostic_key(d) for d in shift_baseline(baseline, build_line_shift(baseline_text, synced))}
         diags = [d for d in diags if _diagnostic_key(d) not in seen]
+    if synced is not None:
+        checks.remember(abs_path, synced, verdict)  # the next edit's baseline is these bytes
     return _report(server_id, abs_path, diags)
 
 
@@ -230,27 +252,6 @@ def _report(server_id: str, abs_path: str, diags: Optional[_Diags]) -> Optional[
     else:
         eventlog.log_clean(server_id, abs_path)
     return diags
-
-
-async def _mark_broken(svc: LSPService, abs_path: str, exc: BaseException) -> None:
-    """Loop-side twin of ``LSPService._mark_broken_for_file`` (that one blocks on the loop)."""
-    srv = svc._server_for(abs_path)
-    key = svc._broken_key(srv, abs_path) if srv is not None else None
-    if srv is None or key is None:
-        return
-    already = svc._is_broken(key)
-    svc._mark_broken(key)
-    with svc._state_lock:
-        ckey = svc._live_key(srv, key[1])
-        client = svc._clients.pop(ckey, None)
-        svc._last_used.pop(ckey, None)
-    if client is not None:
-        try:
-            await asyncio.wait_for(client.shutdown(), timeout=1.0)
-        except Exception:  # best effort on an already-failed server; the pair is marked broken either way
-            logger.debug("shutdown of broken LSP client failed", exc_info=True)
-    if not already:
-        eventlog.log_spawn_failed(key[0], key[1], exc)
 
 
 __all__ = ["INLINE_GRACE", "WRITE_BUDGET", "CheckResult", "EditChecks", "inline_wait", "start"]

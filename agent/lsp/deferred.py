@@ -76,8 +76,8 @@ def post(owner: str, path: str, text: str, baseline_text: Optional[str]) -> None
 
 def take(owner: Optional[str], path: str) -> Optional[_Note]:
     """Withdraw ``owner``'s undelivered note for ``path``: a newer edit of the file supersedes it and
-    diffs against its ``baseline_text``.  Hand it back to :func:`restore` if that newer check yields
-    no verdict, so the older errors are not lost."""
+    diffs against its ``baseline_text``.  The newer check carries it and hands it back to
+    :func:`restore` only if it ends with no verdict, so the older errors are not lost."""
     if not owner:
         return None
     with _LOCK:
@@ -85,9 +85,11 @@ def take(owner: Optional[str], path: str) -> Optional[_Note]:
         return notes.pop(path, None) if notes else None
 
 
-def restore(owner: Optional[str], path: str, note: Optional[_Note]) -> None:
-    if owner and note is not None:
-        post(owner, path, note.text, note.baseline_text)
+def restore(owner: Optional[str], path: str, notes) -> None:
+    """Queue ``notes`` (oldest first) withdrawn by :func:`take` again."""
+    if owner:
+        for note in notes:
+            post(owner, path, note.text, note.baseline_text)
 
 
 def pop_notes(*owners: Optional[str]) -> list[tuple[str, str]]:

@@ -362,15 +362,16 @@ class LSPService:
             diags = []
         self._set_delta_baseline(os.path.abspath(file_path), diags or [])
 
-    def start_edit_check(self, file_path: str, *, pre_text: Optional[str],
-                         inherited: tuple[bool, Optional[str]] = (False, None)):
+    def start_edit_check(self, file_path: str, *, pre_text: Optional[str], owner: Optional[str] = None,
+                         carry: tuple = ()):
         """Non-blocking post-write check (``agent.lsp.edit_check``): a Future of the diagnostics the edit
         introduced, or None when LSP doesn't handle the file.  Replaces snapshot_baseline +
-        get_diagnostics_sync on the write path, which blocked the write on both waits."""
+        get_diagnostics_sync on the write path, which blocked the write on both waits.  ``owner`` = the
+        editing session; ``carry`` = its undelivered notes for the file this check takes over."""
         if not self.enabled_for(file_path):
             return None
         from agent.lsp import edit_check
-        return edit_check.start(self, file_path, pre_text=pre_text, inherited=inherited)
+        return edit_check.start(self, file_path, pre_text=pre_text, owner=owner, carry=carry)
 
     def _set_delta_baseline(self, abs_path: str, diags: _Diags) -> None:
         """Store a baseline, refreshing recency (pop + reinsert) so eviction tracks write order.
@@ -442,29 +443,45 @@ class LSPService:
             self._set_delta_baseline(abs_path, fresh)
         return diags
 
-    def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
-        """Mark the file's ``(server_id, root)`` pair broken after an outer timeout/error.
-        The outer ``_loop.run`` timeout cancels the in-flight spawn before ``_get_or_spawn`` could record
-        the failure; without this every later write would re-pay the full timeout.  Also kills any
-        half-initialized client and logs the failure once."""
+    def _detach_broken(self, file_path: str, exc: BaseException) -> Optional[LSPClient]:
+        """Mark the file's ``(server_id, root)`` pair broken after an outer timeout/error, drop its
+        client from the live maps and log the failure once; returns the dropped client for the caller
+        to shut down.  The outer timeout cancels the in-flight spawn before ``_get_or_spawn`` could
+        record the failure; without this every later write would re-pay the full timeout.  The one
+        owner of this cleanup: ``_mark_broken_for_file`` (tool threads) and
+        ``_mark_broken_for_file_async`` (the loop) only differ in how they await the shutdown."""
         srv = self._server_for(file_path)
         key = self._broken_key(srv, file_path) if srv is not None else None
         if key is None:
-            return
+            return None
         already_broken = self._is_broken(key)
         self._mark_broken(key)
         with self._state_lock:
             ckey = self._live_key(srv, key[1])
             client = self._clients.pop(ckey, None)
             self._last_used.pop(ckey, None)
+        if not already_broken:
+            eventlog.log_spawn_failed(key[0], key[1], exc)
+        return client
+
+    def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
+        """Tool-thread bridge of :meth:`_detach_broken`: shuts the client down through the loop."""
+        client = self._detach_broken(file_path, exc)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — we're already on a slow path.
                 self._loop.run(client.shutdown(), timeout=1.0)
             except Exception:
                 pass
-        if not already_broken:
-            eventlog.log_spawn_failed(key[0], key[1], exc)
+
+    async def _mark_broken_for_file_async(self, file_path: str, exc: BaseException) -> None:
+        """Loop-side :meth:`_detach_broken` (``_mark_broken_for_file`` would block on the loop it runs on)."""
+        client = self._detach_broken(file_path, exc)
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.shutdown(), timeout=1.0)
+            except Exception:  # best effort on an already-failed server; the pair is marked broken either way
+                logger.debug("shutdown of broken LSP client failed", exc_info=True)
 
     def shutdown(self) -> None:
         """Tear down all clients and stop the background loop."""
