@@ -468,3 +468,30 @@ def test_requests_verify_keeps_requests_own_ca_overrides(monkeypatch, no_ca_env)
     monkeypatch.setattr("requests.utils.DEFAULT_CA_BUNDLE_PATH", "/gone/cacert.pem")
     assert ssl_verify.requests_verify() is True
 
+
+
+def test_requests_verify_hands_over_the_platform_store_without_openssl_files(tmp_path, monkeypatch, no_ca_env):
+    """Windows: requests' frozen bundle is gone, certifi cannot be re-derived and OpenSSL has no
+    cafile/capath. ``True`` would make requests raise on the dead path, so the OS store goes over
+    as a PEM bundle that requests accepts."""
+    import ssl
+    from types import SimpleNamespace
+
+    import requests
+
+    from agent import ssl_verify
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+    monkeypatch.setattr(ssl_verify, "_PLATFORM_STORE_BUNDLE", None)
+    monkeypatch.setattr(ssl_verify, "certifi_bundle_path", lambda: None)
+    monkeypatch.setattr("requests.utils.DEFAULT_CA_BUNDLE_PATH", str(tmp_path / "gone" / "cacert.pem"))
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: SimpleNamespace(cafile=None, capath=None))
+
+    verify = ssl_verify.requests_verify()
+    assert isinstance(verify, str) and Path(verify).is_relative_to(tmp_path / "home")
+    assert "BEGIN CERTIFICATE" in Path(verify).read_text()
+    # requests takes the bundle: the request fails on the closed port, not on a missing CA file.
+    with pytest.raises(requests.exceptions.ConnectionError):
+        requests.get("https://127.0.0.1:9/", verify=verify, timeout=2)

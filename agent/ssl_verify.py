@@ -254,7 +254,32 @@ def requests_verify() -> bool | str:
     for candidate in (defaults.cafile, defaults.capath):
         if candidate and Path(candidate).exists():
             return candidate
-    return True
+    # Windows keeps its roots in the system store with no OpenSSL file, and ``True``
+    # would send requests back to the dead frozen path: hand it the store as a bundle.
+    return _platform_store_bundle() or True
+
+
+_PLATFORM_STORE_BUNDLE: Optional[str] = None
+
+
+def _platform_store_bundle() -> Optional[str]:
+    """The OS store's CA certificates written once to a PEM file under HERMES_HOME."""
+    global _PLATFORM_STORE_BUNDLE
+    if _PLATFORM_STORE_BUNDLE and Path(_PLATFORM_STORE_BUNDLE).is_file():
+        return _PLATFORM_STORE_BUNDLE
+    ctx = _stdlib_ssl_context_class()(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_default_certs()
+    certs = ctx.get_ca_certs(binary_form=True)
+    if not certs:
+        return None
+    from hermes_constants import get_hermes_home
+    from utils import atomic_write_text
+
+    path = get_hermes_home() / "cache" / "platform-ca-bundle.pem"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, "".join(ssl.DER_cert_to_PEM_cert(der) for der in certs))
+    _PLATFORM_STORE_BUNDLE = str(path)
+    return _PLATFORM_STORE_BUNDLE
 
 
 def _default_verify() -> bool | ssl.SSLContext:
