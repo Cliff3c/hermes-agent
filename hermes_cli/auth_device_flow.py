@@ -221,9 +221,13 @@ def _default_verify() -> bool | ssl.SSLContext:
     install-environment rotation deleted: the Nous credential exchange builds its context here, and
     in a long-lived gateway it can be the first TLS client constructed after the rotation.
     """
+    from agent.ssl_verify import certifi_bundle_path, platform_ssl_context
+    bundle = certifi_bundle_path()
+    if bundle is None:
+        # httpx's own ``True`` would resolve through the same dead path.
+        return platform_ssl_context()
     if sys.platform == "darwin":
-        from agent.ssl_verify import resolve_httpx_verify
-        return resolve_httpx_verify()
+        return ssl.create_default_context(cafile=bundle)
     return True
 
 
