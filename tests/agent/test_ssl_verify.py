@@ -119,6 +119,12 @@ def _private_https_server(tmp_path: Path) -> Iterator[tuple[Any, Path]]:
             .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
             .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ip_address("127.0.0.1"))]), critical=False)
+            # macOS Security.framework rejects a server cert without these ("not permitted
+            # for this usage"); OpenSSL-backed platforms accept it either way.
+            .add_extension(x509.KeyUsage(digital_signature=True, key_encipherment=True, key_cert_sign=True,
+                                         content_commitment=False, data_encipherment=False, key_agreement=False,
+                                         crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .sign(key, hashes.SHA256()))
     ca = tmp_path / "provider-ca.pem"
     private = tmp_path / "provider.key"
