@@ -3,7 +3,7 @@ title: Nextcloud Talk
 repo: https://github.com/Cliff3c/hermes-nextcloud-talk
 sha: 0df0679d1ed28c2087774fea9ae646a858e7ed70
 subdir: plugin
-description: "Signed Nextcloud Talk bot webhooks and text replies for Hermes, with JSON/XML OCS support. Disclosure — runs an HTTP webhook listener (default 0.0.0.0:8788, HMAC-verified with the bot secret) and sends messages and optional Basic-auth room lookups to your Nextcloud server; registers the `nextcloud_talk` platform, the same id as nextcloud-talk-platform, so install only one of the two."
+description: "Signed Nextcloud Talk bot webhooks and text replies for Hermes, with JSON/XML OCS support. Disclosure — runs an HTTP webhook listener (default 0.0.0.0:8788, HMAC-verified with the bot secret) and sends messages and optional Basic-auth room lookups to your Nextcloud server; registers the `nextcloud_talk` gateway platform."
 maintainer: Cliff3c
 tier: community
 category: platform
