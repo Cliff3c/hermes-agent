@@ -264,6 +264,7 @@ def _rotated_certifi(tmp_path: Path, monkeypatch, *, replacement: bool) -> _Rota
     import sys
 
     import certifi as real_certifi
+    import requests.utils
 
     bundle = Path(real_certifi.where()).read_bytes()  # a real PEM: contexts must load it
     stale = _stand_in_certifi_env(tmp_path, "env-a", bundle)
@@ -278,6 +279,8 @@ def _rotated_certifi(tmp_path: Path, monkeypatch, *, replacement: bool) -> _Rota
     stand_in = importlib.import_module("certifi")
     monkeypatch.setitem(sys.modules, "certifi", stand_in)
     assert Path(stand_in.where()).parent == stale
+    # requests froze its default bundle path from the same certifi at import.
+    monkeypatch.setattr(requests.utils, "DEFAULT_CA_BUNDLE_PATH", stand_in.where())
     shutil.rmtree(stale)
     assert not Path(stand_in.where()).exists()
     return _Rotation(stand_in, stale, live)
@@ -447,3 +450,15 @@ assert live.is_file() and live.parent.resolve() == Path(env_b, 'certifi').resolv
             env=_child_env(tmp_path), capture_output=True, text=True, timeout=60, check=False,
         )
         assert child.returncode == 0, child.stdout + child.stderr
+
+
+def test_requests_verify_keeps_requests_own_ca_overrides(monkeypatch, no_ca_env):
+    """requests reads ``REQUESTS_CA_BUNDLE`` only for ``verify=True``; a healthy install
+    or a configured override must keep it, or a proxy CA stops being trusted."""
+    from agent import ssl_verify
+
+    assert ssl_verify.requests_verify() is True
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/corp/proxy-ca.pem")
+    monkeypatch.setattr("requests.utils.DEFAULT_CA_BUNDLE_PATH", "/gone/cacert.pem")
+    assert ssl_verify.requests_verify() is True
+
