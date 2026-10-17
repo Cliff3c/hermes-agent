@@ -224,7 +224,8 @@ def _default_verify() -> bool | ssl.SSLContext:
     from agent.ssl_verify import certifi_bundle_path, platform_ssl_context
     bundle = certifi_bundle_path()
     if bundle is None:
-        # httpx's own ``True`` would resolve through the same dead path.
+        # No usable certifi bundle (absent, or deleted by a rotation and not re-derivable):
+        # httpx's ``True`` would still resolve through certifi, so hand over the platform store.
         return platform_ssl_context()
     if sys.platform == "darwin":
         return ssl.create_default_context(cafile=bundle)
