@@ -66,3 +66,21 @@ def test_ambiguous_backgrounding_is_still_refused_unchanged(tmp_path, command, e
          patch("tools.terminal_tool._acquire_env", side_effect=AssertionError("must not run")):
         result = json.loads(terminal_tool(command=command))
     assert expected in result["error"]
+
+
+def test_converted_command_never_gets_relaunch_hint_even_with_another_hint(tmp_path, monkeypatch):
+    """A converted `&` command whose spawn also earns another hint (CI-poller shape) still carries
+    the conversion note and never the silent-background "re-launch" advice (a second copy)."""
+    from tools.terminal_tool import terminal_tool
+    from tools.terminal_tool_background import _HOMEBREW_CI_POLLER_HINT, _SILENT_BACKGROUND_HINT
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+    with patch("tools.terminal_tool._get_env_config", return_value=_env_config(tmp_path)), \
+         patch("tools.terminal_tool._start_cleanup_thread"), \
+         patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
+        result = json.loads(terminal_tool(command="echo statusCheckRollup >/dev/null &"))
+
+    assert result.get("error") is None, result
+    assert "trailing & was converted to background=true" in result["auto_backgrounded"]
+    assert _HOMEBREW_CI_POLLER_HINT in result["hint"]
+    assert _SILENT_BACKGROUND_HINT not in result["hint"]

@@ -1185,28 +1185,6 @@ def _with_promoted_note(result_json: str, requested_timeout: int) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-_AUTO_BACKGROUND_NOTE = (
-    "Ran in the background (the trailing & was converted to background=true; Hermes tracks the "
-    "process). Do NOT re-run it. Use process_manage (poll/log/wait/kill, session_id above) to check it."
-)
-
-
-def _with_auto_background_note(result_json: str) -> str:
-    """Attach the trailing-`&` conversion note to a spawn result (unchanged on error). The silent-
-    background hint is dropped: it says to re-launch with notify, which would start a second copy."""
-    try:
-        data = json.loads(result_json)
-    except (TypeError, ValueError):
-        return result_json
-    if not isinstance(data, dict) or data.get("error"):
-        return result_json
-    from tools.terminal_tool_background import _SILENT_BACKGROUND_HINT
-    if data.get("hint") == _SILENT_BACKGROUND_HINT:
-        data.pop("hint")
-    data["auto_backgrounded"] = _AUTO_BACKGROUND_NOTE
-    return json.dumps(data, ensure_ascii=False)
-
-
 def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
     """Cached env for the task, else create it under the per-task creation lock.
 
@@ -1497,11 +1475,10 @@ def terminal_tool(
                 completion_output_chars=_completion_output_chars,
                 heartbeat_seconds=heartbeat,
                 persist_on_release=persist_on_release,
+                auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
-            elif auto_bg is not None:
-                result = _with_auto_background_note(result)
             return _metered(None if _host_local else plan, result)
         return _metered(None if _host_local else plan, _run_foreground(
             command, env, plan,
